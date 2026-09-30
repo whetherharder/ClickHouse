@@ -53,3 +53,8 @@ contrib/snappy
 contrib/xsimd
 contrib/avro
 contrib/crc32c
+contrib/flatbuffers
+contrib/libhdfs3
+contrib/brotli
+contrib/bzip2
+contrib/rapidjson
