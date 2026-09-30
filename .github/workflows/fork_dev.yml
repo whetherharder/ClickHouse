@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 200
 
       # Tree hashes cover sources and submodule pins exactly; hashFiles fails on a tree this size.
       - id: key
@@ -58,9 +58,11 @@ jobs:
           curl -fsS -o /dev/null "https://hub.docker.com/v2/repositories/clickhouse/fasttest/tags/$tag"
           echo "image=clickhouse/fasttest:$tag" >> "$GITHUB_OUTPUT"
 
+      # Sources a feature branch changes on top of this CI branch.
       - id: first
         run: |
-          sources=$(jq -r '[.commits[]? | ((.added // []) + (.modified // []))[] | select(test("^src/.*\\.cpp$"))] | unique | join(" ")' "$GITHUB_EVENT_PATH")
+          git fetch -q --depth=200 origin dev/fork-ci
+          sources=$(git diff --name-only FETCH_HEAD...HEAD -- 'src/*.cpp' | tr '\n' ' ')
           echo "first_sources=$sources" >> "$GITHUB_OUTPUT"
 
       - id: tests
