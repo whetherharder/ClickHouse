@@ -33,7 +33,9 @@ for flag in USE_AVRO USE_AWS_S3 USE_PARQUET; do
 done
 
 rc=0
-timeout --signal=INT "${BUDGET_MIN}m" ninja -C "$BUILD_DIR" -j"$(nproc)" clickhouse-bundle || rc=$?
+timeout --signal=INT "${BUDGET_MIN}m" ninja -C "$BUILD_DIR" clickhouse-bundle > "$BUILD_DIR/build.log" 2>&1 || rc=$?
+grep -E "^FAILED|error:" "$BUILD_DIR/build.log" | head -50 || true
+tail -n 5 "$BUILD_DIR/build.log"
 sccache --show-stats || true
 chmod -R a+rX "$SCCACHE_DIR" || true
 
