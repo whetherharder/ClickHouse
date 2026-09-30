@@ -24,7 +24,8 @@ if [ ! -f "$BUILD_DIR/build.ninja" ]; then
         -DENABLE_LIBRARIES=0 -DENABLE_TESTS=0 -DENABLE_UTILS=0 -DENABLE_THINLTO=0 \
         -DENABLE_NURAFT=1 -DENABLE_SIMDJSON=1 -DENABLE_JEMALLOC=1 -DENABLE_LIBURING=1 -DENABLE_YAML_CPP=1 \
         -DENABLE_RUST=0 \
-        -DENABLE_AWS_S3=1 -DENABLE_AVRO=1 -DENABLE_PARQUET=1
+        -DENABLE_AWS_S3=1 -DENABLE_AVRO=1 -DENABLE_PARQUET=1 -DENABLE_ORC=0 \
+        -DENABLE_THRIFT=1 -DENABLE_BROTLI=1 -DENABLE_BZIP2=1 -DENABLE_RAPIDJSON=1
 fi
 
 for flag in USE_AVRO USE_AWS_S3 USE_PARQUET; do
@@ -48,7 +49,7 @@ if [ -n "${FIRST_SOURCES:-}" ]; then
 fi
 
 rc=0
-timeout --signal=INT "${BUDGET_MIN}m" ninja -C "$BUILD_DIR" clickhouse-bundle > "$BUILD_DIR/build.log" 2>&1 || rc=$?
+timeout --signal=INT "${BUDGET_MIN}m" ninja -C "$BUILD_DIR" clickhouse > "$BUILD_DIR/build.log" 2>&1 || rc=$?
 grep -E "^FAILED|error:" "$BUILD_DIR/build.log" | head -50 || true
 tail -n 5 "$BUILD_DIR/build.log"
 sccache --show-stats || true

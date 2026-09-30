@@ -9,6 +9,7 @@ Upstream workflows run on ClickHouse's self-hosted runners and never start in a 
   A binary is cached by source hash: a push that changes only tests or workflows skips the build.
 - Tests: upstream's `functional_tests.py` in local-run mode on the built binary.
   Patterns default to `iceberg distributed_plan`; a commit message line `tests: <patterns>` overrides them.
+- Integration tests run only when the commit message has a line `integration: <selectors>`.
 - Artifacts: `clickhouse` (zstd binary) and `test-logs`, kept 7 days.
 
 Do not open pull requests inside the fork: `pull_request.yml` would queue jobs for runners that do not exist.
