@@ -32,6 +32,21 @@ for flag in USE_AVRO USE_AWS_S3 USE_PARQUET; do
         || { echo "ERROR: $flag is not enabled, Iceberg would be compiled out"; exit 1; }
 done
 
+# Compile the sources the push changed first: their errors show up in minutes instead of hours.
+if [ -n "${FIRST_SOURCES:-}" ]; then
+    ninja -C "$BUILD_DIR" -t targets all > "$BUILD_DIR/targets.txt"
+    first_targets=()
+    for source in $FIRST_SOURCES; do
+        target=$(grep -F "/${source#src/}.o:" "$BUILD_DIR/targets.txt" | cut -d: -f1 | head -1 || true)
+        [ -n "$target" ] && first_targets+=("$target")
+    done
+    if [ "${#first_targets[@]}" -gt 0 ]; then
+        echo "Compiling changed sources first: ${first_targets[*]}"
+        ninja -C "$BUILD_DIR" "${first_targets[@]}" > "$BUILD_DIR/first.log" 2>&1 \
+            || { grep -E "^FAILED|error:" -A3 "$BUILD_DIR/first.log" | head -100; exit 1; }
+    fi
+fi
+
 rc=0
 timeout --signal=INT "${BUDGET_MIN}m" ninja -C "$BUILD_DIR" clickhouse-bundle > "$BUILD_DIR/build.log" 2>&1 || rc=$?
 grep -E "^FAILED|error:" "$BUILD_DIR/build.log" | head -50 || true

@@ -13,6 +13,9 @@ on:
       binary_key:
         type: string
         required: true
+      first_sources:
+        type: string
+        default: ""
     outputs:
       state:
         description: "done | partial"
@@ -55,6 +58,7 @@ jobs:
         id: build
         env:
           BUILD_BUDGET_MIN: "290"
+          FIRST_SOURCES: ${{ inputs.first_sources }}
         run: |
           docker pull -q "${{ inputs.image }}"
           set +e
@@ -64,6 +68,7 @@ jobs:
             --volume /mnt/ch/sccache:/ClickHouse/ci/tmp/sccache \
             --workdir /ClickHouse \
             --env BUILD_BUDGET_MIN \
+            --env FIRST_SOURCES \
             "${{ inputs.image }}" bash ci/fork/build.sh
           rc=$?
           set -e
@@ -78,7 +83,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ inputs.stage }}
-          path: /mnt/ch/build/build.log
+          path: |
+            /mnt/ch/build/build.log
+            /mnt/ch/build/first.log
           if-no-files-found: ignore
           retention-days: 7
 

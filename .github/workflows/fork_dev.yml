@@ -27,6 +27,7 @@ jobs:
       binary_cached: ${{ steps.lookup.outputs.cache-hit }}
       image: ${{ steps.image.outputs.image }}
       tests: ${{ steps.tests.outputs.tests }}
+      first_sources: ${{ steps.first.outputs.first_sources }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -54,6 +55,11 @@ jobs:
           [ -n "$tag" ] && [ "$tag" != null ]
           echo "image=clickhouse/fasttest:$tag" >> "$GITHUB_OUTPUT"
 
+      - id: first
+        run: |
+          sources=$(jq -r '[.commits[]? | (.added + .modified)[] | select(test("^src/.*\\.cpp$"))] | unique | join(" ")' "$GITHUB_EVENT_PATH")
+          echo "first_sources=$sources" >> "$GITHUB_OUTPUT"
+
       - id: tests
         env:
           INPUT_TESTS: ${{ inputs.tests }}
@@ -70,6 +76,7 @@ jobs:
     with:
       stage: "1"
       image: ${{ needs.prepare.outputs.image }}
+      first_sources: ${{ needs.prepare.outputs.first_sources }}
       binary_key: ${{ needs.prepare.outputs.binary_key }}
 
   build2:
@@ -79,6 +86,7 @@ jobs:
     with:
       stage: "2"
       image: ${{ needs.prepare.outputs.image }}
+      first_sources: ${{ needs.prepare.outputs.first_sources }}
       binary_key: ${{ needs.prepare.outputs.binary_key }}
 
   build3:
@@ -88,6 +96,7 @@ jobs:
     with:
       stage: "3"
       image: ${{ needs.prepare.outputs.image }}
+      first_sources: ${{ needs.prepare.outputs.first_sources }}
       binary_key: ${{ needs.prepare.outputs.binary_key }}
 
   test:
