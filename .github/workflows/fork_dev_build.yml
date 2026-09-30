@@ -1,0 +1,104 @@
+# Fork-only: one build stage of fork_dev.yml. See ci/fork/README.md.
+name: ForkDevBuildStage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
+      binary_key:
+        type: string
+        required: true
+    outputs:
+      state:
+        description: "done | partial"
+        value: ${{ jobs.build.outputs.state }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    outputs:
+      state: ${{ steps.build.outputs.state }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo mkdir -p /mnt/ch/build /mnt/ch/sccache
+          sudo chown -R "$(id -u):$(id -g)" /mnt/ch
+          df -h / /mnt
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Checkout submodules
+        run: |
+          for attempt in 1 2 3; do
+            git submodule update --init --depth 1 --single-branch --jobs 8 -- $(cat ci/fork/submodules.txt) && exit 0
+            sleep $((attempt * 20))
+          done
+          exit 1
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/ch/sccache
+          key: sccache-${{ github.run_id }}-${{ inputs.stage }}
+          restore-keys: sccache-
+
+      - name: Build
+        id: build
+        env:
+          BUILD_BUDGET_MIN: "290"
+        run: |
+          docker pull -q "${{ inputs.image }}"
+          set +e
+          docker run --rm --network=host \
+            --volume "$PWD:/ClickHouse" \
+            --volume /mnt/ch/build:/ClickHouse/ci/tmp/build \
+            --volume /mnt/ch/sccache:/ClickHouse/ci/tmp/sccache \
+            --workdir /ClickHouse \
+            --env BUILD_BUDGET_MIN \
+            "${{ inputs.image }}" bash ci/fork/build.sh
+          rc=$?
+          set -e
+          case "$rc" in
+            0)   echo "state=done" >> "$GITHUB_OUTPUT" ;;
+            124) echo "state=partial" >> "$GITHUB_OUTPUT" ;;
+            *)   exit "$rc" ;;
+          esac
+
+      - name: Save compiler cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/ch/sccache
+          key: sccache-${{ github.run_id }}-${{ inputs.stage }}
+
+      - name: Package binary
+        if: steps.build.outputs.state == 'done'
+        run: |
+          mkdir -p fork-bin
+          sudo zstd -T0 -10 /mnt/ch/build/programs/clickhouse -o fork-bin/clickhouse.zst
+          sudo chown -R "$(id -u):$(id -g)" fork-bin
+          ls -lh fork-bin
+
+      - name: Cache binary
+        if: steps.build.outputs.state == 'done'
+        uses: actions/cache/save@v4
+        with:
+          path: fork-bin
+          key: ${{ inputs.binary_key }}
+
+      - name: Upload binary
+        if: steps.build.outputs.state == 'done'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickhouse
+          path: fork-bin/clickhouse.zst
+          retention-days: 7

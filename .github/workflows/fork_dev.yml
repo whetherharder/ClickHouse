@@ -1,0 +1,142 @@
+# Fork-only CI on GitHub-hosted runners: build ClickHouse with Iceberg support, then run selected
+# functional tests. Upstream workflows need ClickHouse's self-hosted runners. See ci/fork/README.md.
+name: ForkDev
+
+on:
+  push:
+    branches: ['dev/**']
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "clickhouse-test name patterns, space separated"
+        default: "iceberg distributed_plan"
+
+concurrency:
+  group: fork-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A push runs these; a commit message line `tests: <patterns>` overrides them.
+  DEFAULT_TESTS: "iceberg distributed_plan"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      binary_key: ${{ steps.key.outputs.binary_key }}
+      binary_cached: ${{ steps.lookup.outputs.cache-hit }}
+      image: ${{ steps.image.outputs.image }}
+      tests: ${{ steps.tests.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      # Tree hashes cover sources and submodule pins exactly; hashFiles fails on a tree this size.
+      - id: key
+        run: |
+          trees=$(git ls-tree HEAD src programs base cmake contrib CMakeLists.txt ci/fork/build.sh ci/fork/submodules.txt | sha256sum | cut -c1-32)
+          echo "binary_key=bin-$trees" >> "$GITHUB_OUTPUT"
+
+      - id: lookup
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-bin
+          key: ${{ steps.key.outputs.binary_key }}
+          lookup-only: true
+
+      # Upstream CI tags images by content digest; the most recently published multi-arch tag
+      # matches a recent master closely enough for this fork's builds.
+      - id: image
+        run: |
+          tag=$(curl -fsSL 'https://hub.docker.com/v2/repositories/clickhouse/fasttest/tags?page_size=20&ordering=last_updated' \
+            | jq -r '[.results[].name | select(test("^[0-9a-f]{20}$"))][0]')
+          [ -n "$tag" ] && [ "$tag" != null ]
+          echo "image=clickhouse/fasttest:$tag" >> "$GITHUB_OUTPUT"
+
+      - id: tests
+        env:
+          INPUT_TESTS: ${{ inputs.tests }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          from_commit=$(printf '%s\n' "$COMMIT_MESSAGE" | sed -n 's/^tests: *//p' | head -1)
+          echo "tests=${INPUT_TESTS:-${from_commit:-$DEFAULT_TESTS}}" >> "$GITHUB_OUTPUT"
+
+  # A cold build does not fit one 6 h job on 4 vCPU. Each stage resumes from the previous stage's compiler cache.
+  build1:
+    needs: prepare
+    if: needs.prepare.outputs.binary_cached != 'true'
+    uses: ./.github/workflows/fork_dev_build.yml
+    with:
+      stage: "1"
+      image: ${{ needs.prepare.outputs.image }}
+      binary_key: ${{ needs.prepare.outputs.binary_key }}
+
+  build2:
+    needs: [prepare, build1]
+    if: needs.build1.outputs.state == 'partial'
+    uses: ./.github/workflows/fork_dev_build.yml
+    with:
+      stage: "2"
+      image: ${{ needs.prepare.outputs.image }}
+      binary_key: ${{ needs.prepare.outputs.binary_key }}
+
+  build3:
+    needs: [prepare, build2]
+    if: needs.build2.outputs.state == 'partial'
+    uses: ./.github/workflows/fork_dev_build.yml
+    with:
+      stage: "3"
+      image: ${{ needs.prepare.outputs.image }}
+      binary_key: ${{ needs.prepare.outputs.binary_key }}
+
+  test:
+    needs: [prepare, build1, build2, build3]
+    if: >-
+      always() && (needs.prepare.outputs.binary_cached == 'true'
+        || needs.build1.outputs.state == 'done'
+        || needs.build2.outputs.state == 'done'
+        || needs.build3.outputs.state == 'done')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: fork-bin
+          key: ${{ needs.prepare.outputs.binary_key }}
+          fail-on-cache-miss: true
+
+      - name: Unpack binary
+        run: |
+          mkdir -p ci/tmp
+          zstd -d fork-bin/clickhouse.zst -o ci/tmp/clickhouse
+          chmod +x ci/tmp/clickhouse
+          ci/tmp/clickhouse local --query "SELECT version(), count() FROM system.table_functions WHERE name = 'icebergLocal'"
+
+      - name: Functional tests
+        env:
+          TESTS: ${{ needs.prepare.outputs.tests }}
+        run: |
+          python3 -m pip install --quiet boto3 requests
+          # Word splitting of $TESTS is intended: one --test value per pattern.
+          python3 -m ci.praktika run "Stateless tests (amd_debug, parallel)" --test $TESTS
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            ci/tmp/*.log
+            ci/tmp/*.tsv
+            ci/tmp/*.json
+            ci/tmp/var/log/clickhouse-server/
+          if-no-files-found: ignore
+          retention-days: 7
