@@ -1014,7 +1014,15 @@ void tryMakeDistributedRead(QueryPlan::Node & node, QueryPlan::Nodes & nodes, co
 
         read_from_object_storage_step->setDistributedRead(bucket_count);
 #else
-        return;
+        if (!read_from_object_storage_step->isSerializable())
+            return;
+
+        /// Unknown size is distributed: a data lake without a snapshot summary is not necessarily small.
+        const auto total_rows = read_from_object_storage_step->totalRowsInSnapshot();
+        if (total_rows && *total_rows <= optimization_settings.distributed_plan_max_rows_to_broadcast)
+            return;
+
+        read_from_object_storage_step->setDistributedRead(bucket_count);
 #endif
     }
 
@@ -1387,11 +1395,9 @@ Strings makeListOfShardsForReadStep(const IQueryPlanStep * read_step)
     if (read_from_mt)
         return read_from_mt->getShardsForDistributedRead();
 
-#if CLICKHOUSE_CLOUD
     const auto * read_from_object_storage = dynamic_cast<const ReadFromObjectStorageStep *>(read_step);
     if (read_from_object_storage)
         return read_from_object_storage->getShardsForDistributedRead();
-#endif
 
     return {"0"};   /// One shard by default if read step is not distributed
 }

@@ -170,6 +170,10 @@ public:
 
     std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
+    /// Columns, sorting key and file listing of the result all come from `state`.
+    StorageSnapshotPtr getStorageSnapshotForTableState(
+        const StorageSnapshotPtr & storage_snapshot, const DataLakeTableStateSnapshot & state, ContextPtr local_context) const;
+
     std::shared_ptr<DataLake::ICatalog> getCatalog() const { return catalog; }
 
     /// True when the target commits the refresh cursor atomically with the data (Iceberg on a CAS catalog),

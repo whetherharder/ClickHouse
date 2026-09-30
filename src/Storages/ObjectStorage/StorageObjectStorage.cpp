@@ -689,6 +689,23 @@ std::optional<UInt64> StorageObjectStorage::totalBytes(ContextPtr query_context)
     return configuration->totalBytes(query_context);
 }
 
+StorageSnapshotPtr StorageObjectStorage::getStorageSnapshotForTableState(
+    const StorageSnapshotPtr & storage_snapshot, const DataLakeTableStateSnapshot & state, ContextPtr local_context) const
+{
+    StorageInMemoryMetadata pinned = *storage_snapshot->metadata;
+    pinned.setDataLakeTableState(state);
+
+    /// Reload columns and sorting key from the same state so they cannot diverge.
+    if (configuration->shouldReloadSchemaForConsistency(local_context))
+    {
+        if (auto rebuilt = configuration->buildStorageMetadataFromState(state, local_context))
+            pinned = rebuilt->withVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
+                rebuilt->columns, local_context, format_settings, configuration->partition_strategy_type));
+    }
+
+    return std::make_shared<StorageSnapshot>(*this, std::make_shared<StorageInMemoryMetadata>(std::move(pinned)));
+}
+
 void StorageObjectStorage::read(
     QueryPlan & query_plan,
     const Names & column_names,
@@ -738,21 +755,7 @@ void StorageObjectStorage::read(
             configuration->update(object_storage, local_context);
 
         if (auto state = configuration->getTableStateSnapshot(local_context))
-        {
-            StorageInMemoryMetadata pinned = *storage_snapshot->metadata;
-            pinned.setDataLakeTableState(*state);
-
-            /// Reload columns and sorting key from the same state so they cannot diverge.
-            if (configuration->shouldReloadSchemaForConsistency(local_context))
-            {
-                if (auto rebuilt = configuration->buildStorageMetadataFromState(*state, local_context))
-                    pinned = rebuilt->withVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
-                        rebuilt->columns, local_context, format_settings, configuration->partition_strategy_type));
-            }
-
-            storage_snapshot = std::make_shared<StorageSnapshot>(
-                *this, std::make_shared<StorageInMemoryMetadata>(std::move(pinned)));
-        }
+            storage_snapshot = getStorageSnapshotForTableState(storage_snapshot, *state, local_context);
     }
 
     if (distributed_processing && local_context->getSettingsRef()[Setting::max_streams_for_files_processing_in_cluster_functions])

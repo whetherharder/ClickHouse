@@ -19,6 +19,17 @@
 #include <Interpreters/Context.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Storages/VirtualColumnUtils.h>
+#include <Common/SipHash.h>
+#include <Common/typeid_cast.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/SelectQueryOptions.h>
+#include <Planner/Utils.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/IParameterLookup.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/ReadNothingStep.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeTableStateSnapshot.h>
+#include <TableFunctions/ITableFunction.h>
 #include <boost/algorithm/string/predicate.hpp>
 
 #include <algorithm>
@@ -37,6 +48,12 @@ namespace Setting
 {
     extern const SettingsBool parallelize_output_from_storages;
     extern const SettingsBool s3_validate_etag_on_read;
+}
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int UNKNOWN_TABLE;
 }
 
 
@@ -106,6 +123,9 @@ void ReadFromObjectStorageStep::updatePrewhereInfo(const PrewhereInfoPtr & prewh
 void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & build_settings)
 {
     createIterator();
+#if !CLICKHOUSE_CLOUD
+    keepOnlyBucketOfDistributedRead(build_settings);
+#endif
 
     Pipes pipes;
     auto context = getContext();
@@ -248,11 +268,9 @@ bool ReadFromObjectStorageStep::canUseLazyMaterialization() const
     if (!configuration->dataFilesAreImmutable() && !reread_is_generation_pinned)
         return false;
 
-#if CLICKHOUSE_CLOUD
     /// The transformed plan is not serializable.
     if (distributed_read_bucket_count)
         return false;
-#endif
 
     return true;
 }
@@ -303,5 +321,216 @@ InputOrderInfoPtr ReadFromObjectStorageStep::getDataOrder() const
 {
     return convertSortingKeyToInputOrder(storage_snapshot->metadata->getSortingKey());
 }
+
+/// ClickHouse Cloud has its own implementation of the distributed read.
+#if !CLICKHOUSE_CLOUD
+
+namespace
+{
+
+/// Every worker enumerates the same pinned table state, so choosing by object identity alone
+/// makes the buckets disjoint and complete without shipping file lists.
+class ObjectIteratorOfBucket : public IObjectIterator
+{
+public:
+    ObjectIteratorOfBucket(ObjectIterator iterator_, UInt64 bucket_, UInt64 total_buckets_)
+        : iterator(std::move(iterator_)), bucket(bucket_), total_buckets(total_buckets_)
+    {
+    }
+
+    ObjectInfoPtr next(size_t processor) override
+    {
+        while (auto object = iterator->next(processor))
+            if (sipHash64(object->getIdentifier()) % total_buckets == bucket)
+                return object;
+        return nullptr;
+    }
+
+    size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
+    std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
+
+    void setEmitProfileEvents(bool value) override
+    {
+        emit_profile_events = value;
+        iterator->setEmitProfileEvents(value);
+    }
+
+private:
+    const ObjectIterator iterator;
+    const UInt64 bucket;
+    const UInt64 total_buckets;
+};
+
+std::optional<DataLakeTableStateSnapshot> getIcebergTableState(const StorageSnapshotPtr & storage_snapshot)
+{
+    const auto & state = storage_snapshot->metadata->datalake_table_state;
+    if (!state || !std::holds_alternative<Iceberg::TableStateSnapshot>(*state))
+        return {};
+    return state;
+}
+
+}
+
+void ReadFromObjectStorageStep::setDistributedRead(size_t bucket_count)
+{
+    distributed_read_bucket_count = bucket_count;
+}
+
+void ReadFromObjectStorageStep::keepOnlyBucketOfDistributedRead(const BuildQueryPipelineSettings & build_settings)
+{
+    if (distributed_read_bucket_count == 0)
+        return;
+
+    if (!build_settings.parameter_lookup)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "A bucketed read from {} is executed outside of a distributed plan task", storage_id.getNameForLogs());
+
+    const UInt64 bucket = parse<UInt64>(build_settings.parameter_lookup->getParameter("bucket_id").safeGet<String>());
+    const UInt64 total_buckets = build_settings.parameter_lookup->getParameter("total_buckets").safeGet<UInt64>();
+    if (total_buckets != distributed_read_bucket_count || bucket >= total_buckets)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Bucket {} of {} does not match the distributed read from {} into {} buckets",
+            bucket, total_buckets, storage_id.getNameForLogs(), distributed_read_bucket_count);
+
+    iterator_wrapper = std::make_shared<ObjectIteratorOfBucket>(std::move(iterator_wrapper), bucket, total_buckets);
+}
+
+Strings ReadFromObjectStorageStep::getShardsForDistributedRead() const
+{
+    if (distributed_read_bucket_count == 0)
+        return {"0"};
+
+    Strings list_of_shards;
+    for (size_t i = 0; i < distributed_read_bucket_count; ++i)
+        list_of_shards.push_back(std::to_string(i));
+    return list_of_shards;
+}
+
+bool ReadFromObjectStorageStep::isSerializable() const
+{
+    /// A worker resolves the table by name, which a table function does not have.
+    return !distributed_processing
+        && !lazy_row_index_registry
+        && storage_id.hasDatabase()
+        && storage_id.database_name != ITableFunction::getDatabaseName()
+        && configuration->isDataLakeConfiguration()
+        && getIcebergTableState(storage_snapshot).has_value();
+}
+
+std::optional<size_t> ReadFromObjectStorageStep::totalRowsInSnapshot() const
+{
+    return configuration->totalRows(getContext());
+}
+
+void ReadFromObjectStorageStep::serialize(Serialization & ctx) const
+{
+    const auto state = getIcebergTableState(storage_snapshot);
+    if (!isSerializable() || !state)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Reading from {} cannot be serialized", storage_id.getNameForLogs());
+
+    writeStringBinary(storage_id.getDatabaseName(), ctx.out);
+    writeStringBinary(storage_id.getTableName(), ctx.out);
+    writeVarUInt(required_source_columns.size(), ctx.out);
+    for (const auto & column : required_source_columns)
+        writeStringBinary(column, ctx.out);
+
+    writeVarUInt(max_block_size, ctx.out);
+    writeVarUInt(max_num_streams, ctx.out);
+
+    UInt8 flags = 0;
+    if (need_only_count)
+        flags |= 1;
+    if (query_info.row_level_filter)
+        flags |= 2;
+    if (query_info.prewhere_info)
+        flags |= 4;
+    writeIntBinary(flags, ctx.out);
+
+    if (query_info.row_level_filter)
+        query_info.row_level_filter->serialize(ctx);
+    if (query_info.prewhere_info)
+        query_info.prewhere_info->serialize(ctx);
+
+    serializeDataLakeTableStateSnapshot(*state, ctx.out);
+    writeVarUInt(distributed_read_bucket_count, ctx.out);
+}
+
+std::unique_ptr<IQueryPlanStep> ReadFromObjectStorageStep::deserialize(Deserialization & ctx)
+{
+    String database_name;
+    String table_name;
+    readStringBinary(database_name, ctx.in);
+    readStringBinary(table_name, ctx.in);
+
+    size_t num_columns = 0;
+    readVarUInt(num_columns, ctx.in);
+    Names column_names(num_columns);
+    for (auto & column : column_names)
+        readStringBinary(column, ctx.in);
+
+    UInt64 max_block_size = 0;
+    readVarUInt(max_block_size, ctx.in);
+    UInt64 num_streams = 0;
+    readVarUInt(num_streams, ctx.in);
+
+    UInt8 flags = 0;
+    readIntBinary(flags, ctx.in);
+
+    SelectQueryInfo query_info;
+    query_info.optimize_trivial_count = flags & 1;
+    if (flags & 2)
+        query_info.row_level_filter = std::make_shared<FilterDAGInfo>(FilterDAGInfo::deserialize(ctx));
+    if (flags & 4)
+        query_info.prewhere_info = std::make_shared<PrewhereInfo>(PrewhereInfo::deserialize(ctx));
+
+    auto state = deserializeDataLakeTableStateSnapshot(ctx.in);
+    size_t distributed_read_bucket_count = 0;
+    readVarUInt(distributed_read_bucket_count, ctx.in);
+
+    if (ctx.skipping)
+        return std::make_unique<ReadNothingStep>(ctx.output_header);
+
+    /// Same as for `ReadFromMergeTree`: a shipped plan does not carry the limits of the read.
+    auto storage_limits = std::make_shared<StorageLimitsList>();
+    storage_limits->emplace_back(buildStorageLimits(*ctx.context, SelectQueryOptions(QueryProcessingStage::FetchColumns)));
+    query_info.storage_limits = std::move(storage_limits);
+
+    /// The table could be dropped concurrently after the plan was serialized.
+    StorageID table_id(database_name, table_name);
+    auto storage = DatabaseCatalog::instance().getTable(table_id, ctx.context);
+    auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(storage.get());
+    if (!object_storage_table)
+        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {} is not an object storage table", table_id.getNameForLogs());
+    ctx.storage_holders.push_back(storage);
+
+    if (ctx.context->hasQueryContext())
+        ctx.context->getQueryContext()->addQueryAccessInfo(storage->getStorageID(), column_names);
+
+    /// Loads metadata at least as new as the initiator's, so the pinned schema is known here.
+    object_storage_table->updateExternalDynamicMetadataIfExists(ctx.context);
+    const auto metadata_snapshot = object_storage_table->getInMemoryMetadataPtr(ctx.context, false);
+    auto storage_snapshot = object_storage_table->getStorageSnapshot(metadata_snapshot, ctx.context);
+    storage_snapshot = object_storage_table->getStorageSnapshotForTableState(storage_snapshot, state, ctx.context);
+
+    QueryPlan plan;
+    object_storage_table->read(
+        plan, column_names, storage_snapshot, query_info, ctx.context, QueryProcessingStage::FetchColumns, max_block_size, num_streams);
+
+    auto * root = plan.getRootNode();
+    auto * step = root ? typeid_cast<ReadFromObjectStorageStep *>(root->step.get()) : nullptr;
+    if (!step || !root->children.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Reading from {} did not produce a single ReadFromObjectStorage step", table_id.getNameForLogs());
+
+    step->setDistributedRead(distributed_read_bucket_count);
+    return std::move(root->step);
+}
+
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry);
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry)
+{
+    registry.registerStep(ReadFromObjectStorageStep::STEP_NAME, ReadFromObjectStorageStep::deserialize);
+}
+
+#endif
 
 }

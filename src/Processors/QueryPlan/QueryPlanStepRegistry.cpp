@@ -3,6 +3,8 @@
 
 #include <algorithm>
 
+#include "config.h"
+
 namespace DB
 {
 
@@ -121,6 +123,9 @@ void registerGatherReceiveStep(QueryPlanStepRegistry & registry);
 void registerBroadcastSendStep(QueryPlanStepRegistry & registry);
 void registerBroadcastReceiveStep(QueryPlanStepRegistry & registry);
 void registerReadFromMergeTreeStep(QueryPlanStepRegistry & registry);
+#if !CLICKHOUSE_CLOUD
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry);
+#endif
 
 void registerReadNothingStep(QueryPlanStepRegistry & registry);
 void registerReadFromTableStep(QueryPlanStepRegistry & registry);
@@ -169,6 +174,9 @@ void QueryPlanStepRegistry::registerPlanSteps()
     registerBroadcastSendStep(registry);
     registerBroadcastReceiveStep(registry);
     registerReadFromMergeTreeStep(registry);
+#if !CLICKHOUSE_CLOUD
+    registerReadFromObjectStorageStep(registry);
+#endif
 
     registerReadNothingStep(registry);
     registerReadFromTableStep(registry);
