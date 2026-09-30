@@ -46,18 +46,21 @@ jobs:
           key: ${{ steps.key.outputs.binary_key }}
           lookup-only: true
 
-      # Upstream CI tags images by content digest; the most recently published multi-arch tag
-      # matches a recent master closely enough for this fork's builds.
+      # The tag upstream CI publishes for the Dockerfile in this commit.
       - id: image
         run: |
-          tag=$(curl -fsSL 'https://hub.docker.com/v2/repositories/clickhouse/fasttest/tags?page_size=20&ordering=last_updated' \
-            | jq -r '[.results[].name | select(test("^[0-9a-f]{20}$"))][0]')
-          [ -n "$tag" ] && [ "$tag" != null ]
+          tag=$(python3 -c "
+          import sys; sys.path[:0] = ['.', 'ci']
+          from ci.praktika.digest import Digest
+          from ci.defs.defs import DOCKERS
+          config = next(c for c in DOCKERS if c.name == 'clickhouse/fasttest')
+          print(Digest().calc_docker_digest(config, DOCKERS))" | tail -1)
+          curl -fsS -o /dev/null "https://hub.docker.com/v2/repositories/clickhouse/fasttest/tags/$tag"
           echo "image=clickhouse/fasttest:$tag" >> "$GITHUB_OUTPUT"
 
       - id: first
         run: |
-          sources=$(jq -r '[.commits[]? | (.added + .modified)[] | select(test("^src/.*\\.cpp$"))] | unique | join(" ")' "$GITHUB_EVENT_PATH")
+          sources=$(jq -r '[.commits[]? | ((.added // []) + (.modified // []))[] | select(test("^src/.*\\.cpp$"))] | unique | join(" ")' "$GITHUB_EVENT_PATH")
           echo "first_sources=$sources" >> "$GITHUB_OUTPUT"
 
       - id: tests
