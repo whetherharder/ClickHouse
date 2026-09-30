@@ -18,7 +18,7 @@ sccache --start-server || echo "WARNING: sccache did not start, building without
 
 if [ ! -f "$BUILD_DIR/build.ninja" ]; then
     cmake -G Ninja -S /ClickHouse -B "$BUILD_DIR" \
-        -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 \
+        -DCMAKE_C_COMPILER="clang-${LLVM_VERSION}" -DCMAKE_CXX_COMPILER="clang++-${LLVM_VERSION}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCOMPILER_CACHE=sccache \
         -DENABLE_LIBRARIES=0 -DENABLE_TESTS=0 -DENABLE_UTILS=0 -DENABLE_THINLTO=0 \
